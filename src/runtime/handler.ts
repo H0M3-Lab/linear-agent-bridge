@@ -41,6 +41,13 @@ import {
 import { mapGatewayEventToActivity } from "./event-mapper.js";
 import { logPhase, resolveCorrelationId } from "./trace.js";
 import { redactHeaders } from "./redact.js";
+import {
+  completeDelivery,
+  deliveryId,
+  pendingDeliveries,
+  persistDelivery,
+  recordDeliveryFailure,
+} from "./durable-delivery-store.js";
 import type {
   Gateway,
   GatewayCompletionEvent,
@@ -70,6 +77,7 @@ const BOOTSTRAP_DUPLICATE_WINDOW_MS = 5000;
 const PROMPTED_DUPLICATE_WINDOW_MS = 5000;
 const COMMENT_PROMPT_HINT_TTL_MS = 2 * 60 * 1000;
 const MISSING_PROMPT_HINT_DELAYS_MS = [0, 250, 500, 1000];
+const MAX_CONCURRENT_DELIVERIES = 4;
 
 const sessionQueues = new Map<string, Promise<void>>();
 const recentEventKeys = new Map<string, number>();
@@ -106,6 +114,52 @@ export function createLinearWebhook(
 ): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   const gateway = createGateway(api);
   api.logger.info?.(`linear runtime: selected backend=${gateway.backend}`);
+  let draining: Promise<void> | undefined;
+  const activeDeliveries = new Set<string>();
+  const requestDrain = (): void => {
+    if (draining) return;
+    draining = drainPending().finally(() => {
+      draining = undefined;
+    });
+  };
+  const drainPending = async (): Promise<void> => {
+    for (const delivery of await pendingDeliveries()) {
+      if (activeDeliveries.size >= MAX_CONCURRENT_DELIVERIES) break;
+      if (activeDeliveries.has(delivery.id)) continue;
+      activeDeliveries.add(delivery.id);
+      void processDelivery(delivery);
+    }
+  };
+  const processDelivery = async (delivery: Awaited<ReturnType<typeof pendingDeliveries>>[number]): Promise<void> => {
+    try {
+      const trigger = parseLinearTrigger(delivery.payload);
+      await processWebhook(
+        api,
+        normalizeCfg(api.pluginConfig),
+        delivery.payload,
+        trigger,
+        gateway,
+        delivery.correlationId,
+      );
+      await completeDelivery(delivery);
+    } catch (error) {
+      await recordDeliveryFailure(delivery).catch((storeError) => {
+        api.logger.error?.(
+          `linear runtime could not persist delivery retry state: ${storeError instanceof Error ? storeError.message : String(storeError)}`,
+        );
+      });
+      api.logger.warn?.(
+        `linear runtime delivery deferred id=${delivery.id} attempt=${delivery.attempts}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      const retryMs = Math.min(60_000, 1_000 * 2 ** Math.min(delivery.attempts, 6));
+      setTimeout(requestDrain, retryMs).unref?.();
+    } finally {
+      activeDeliveries.delete(delivery.id);
+      setTimeout(requestDrain, 0).unref?.();
+    }
+  };
+  // Recover events acknowledged before a process restart.
+  setTimeout(requestDrain, 0).unref?.();
   return async (req, res) => {
     if (req.method !== "POST") {
       res.statusCode = 405;
@@ -144,15 +198,21 @@ export function createLinearWebhook(
 
     const cfg = normalizeCfg(api.pluginConfig);
     const signature = readHeader(req, "linear-signature");
-    if (cfg.linearWebhookSecret) {
-      if (!verifySignature(cfg.linearWebhookSecret, signature, read.body)) {
-        logPhase(api.logger, cid, "signature_rejected");
-        res.statusCode = 401;
-        res.end("Unauthorized");
-        return;
-      }
-      logPhase(api.logger, cid, "signature_verified");
+    if (!cfg.linearWebhookSecret) {
+      logPhase(api.logger, cid, "signature_rejected", {
+        reason: "webhook_secret_not_configured",
+      });
+      res.statusCode = 503;
+      res.end("Webhook verification is not configured");
+      return;
     }
+    if (!verifySignature(cfg.linearWebhookSecret, signature, read.body)) {
+      logPhase(api.logger, cid, "signature_rejected");
+      res.statusCode = 401;
+      res.end("Unauthorized");
+      return;
+    }
+    logPhase(api.logger, cid, "signature_verified");
 
     let parsed: unknown;
     try {
@@ -188,17 +248,27 @@ export function createLinearWebhook(
       }
     }
 
+    const identity = trigger?.eventKey ||
+      readString(enrichedPayload.linearDelivery) ||
+      readString(enrichedPayload.webhookId) ||
+      readString(enrichedPayload.id) ||
+      read.body.toString("base64");
+    try {
+      // Persist before acknowledging so Linear retries if the durable queue is unavailable.
+      await persistDelivery(deliveryId(identity), enrichedPayload, cid);
+    } catch (error) {
+      api.logger.error?.(
+        `linear runtime could not persist delivery: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      res.statusCode = 503;
+      res.end("Delivery queue unavailable");
+      return;
+    }
     res.statusCode = 202;
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.end(JSON.stringify({ ok: true }));
 
-    queueMicrotask(() => {
-      processWebhook(api, cfg, enrichedPayload, trigger, gateway, cid).catch((error) => {
-        api.logger.warn?.(
-          `linear runtime webhook error: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
-    });
+    queueMicrotask(requestDrain);
   };
 }
 
@@ -332,7 +402,7 @@ async function processWebhook(
     session: trigger.sessionId,
     action: trigger.action,
   });
-  enqueueSessionTurn(trigger.sessionId, async () => {
+  await enqueueSessionTurn(trigger.sessionId, async () => {
     await executeTurn(api, cfg, trigger, gateway, cid);
   });
 }
@@ -537,7 +607,7 @@ async function resolveCommentSession(
 function enqueueSessionTurn(
   sessionId: string,
   task: () => Promise<void>,
-): void {
+): Promise<void> {
   const previous = sessionQueues.get(sessionId) ?? Promise.resolve();
   const next = previous
     .catch(() => undefined)
@@ -548,6 +618,7 @@ function enqueueSessionTurn(
       }
     });
   sessionQueues.set(sessionId, next);
+  return next;
 }
 
 async function handleStopSignal(

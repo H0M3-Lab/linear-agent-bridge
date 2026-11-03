@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -186,12 +187,14 @@ interface Bridge {
  * builds the handler. `restore()` undoes the global mutations.
  */
 function buildBridge(hermesUrl: string, extraConfig: Record<string, unknown>): Bridge {
-  const envKeys = ["BACKEND", "HERMES_URL", "HERMES_API_KEY", "HERMES_MODEL"];
+  const envKeys = ["BACKEND", "HERMES_URL", "HERMES_API_KEY", "HERMES_MODEL", "LINEAR_EVENT_STORE_DIR"];
   const envSnap = new Map(envKeys.map((k) => [k, process.env[k]]));
   process.env.BACKEND = "hermes";
   process.env.HERMES_URL = hermesUrl;
   process.env.HERMES_API_KEY = "test-key";
   process.env.HERMES_MODEL = "hermes-agent";
+  const eventStoreDir = `${String(extraConfig.hermesContinuationStorePath ?? tmpStore("default"))}.events`;
+  process.env.LINEAR_EVENT_STORE_DIR = eventStoreDir;
 
   const activities: ActivityContent[] = [];
   const waiters: { pred: (a: ActivityContent) => boolean; resolve: (a: ActivityContent) => void }[] = [];
@@ -257,6 +260,7 @@ function buildBridge(hermesUrl: string, extraConfig: Record<string, unknown>): B
     logs,
     restore: () => {
       globalThis.fetch = realFetch;
+      fs.rmSync(eventStoreDir, { recursive: true, force: true });
       for (const [k, v] of envSnap) {
         if (v === undefined) delete process.env[k];
         else process.env[k] = v;
@@ -279,9 +283,11 @@ async function postWebhook(
   bridge: Bridge,
   payload: Record<string, unknown>,
   deliveryId: string,
-): Promise<void> {
+  expectedStatus = 202,
+  signingSecret = SECRET,
+): Promise<number> {
   const raw = Buffer.from(JSON.stringify(payload));
-  const signature = createHmac("sha256", SECRET).update(raw).digest("hex");
+  const signature = createHmac("sha256", signingSecret).update(raw).digest("hex");
   const req = Readable.from([raw]) as unknown as IncomingMessage & { headers: Record<string, string> };
   req.method = "POST";
   req.url = "/plugins/linear/linear";
@@ -308,7 +314,8 @@ async function postWebhook(
 
   await bridge.handler(req, res as unknown as ServerResponse);
   await ended;
-  assert.equal(res.statusCode, 202, `webhook should 202, got ${res.statusCode}`);
+  assert.equal(res.statusCode, expectedStatus, `webhook should ${expectedStatus}, got ${res.statusCode}`);
+  return res.statusCode;
 }
 
 const sessionPayload = (
@@ -326,6 +333,36 @@ const tmpStore = (name: string): string =>
   path.join(os.tmpdir(), `bridge-e2e-${name}-${process.pid}.json`);
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+test("webhook fails closed without a configured secret or with an invalid signature", async () => {
+  const mock = await startMockHermes(() => ({ frames: textRun("unused", "must not run") }));
+  const bridge = buildBridge(mock.url, {
+    hermesContinuationStorePath: tmpStore("signature"),
+    linearWebhookSecret: undefined,
+  });
+  try {
+    await postWebhook(bridge, sessionPayload("sess-missing-secret", "created"), "missing-secret", 503);
+    bridge.restore();
+    const invalid = buildBridge(mock.url, {
+      hermesContinuationStorePath: tmpStore("signature-invalid"),
+    });
+    try {
+      await postWebhook(
+        invalid,
+        sessionPayload("sess-invalid-signature", "created"),
+        "invalid-signature",
+        401,
+        "wrong-secret",
+      );
+    } finally {
+      invalid.restore();
+    }
+    assert.equal(mock.bodies.length, 0, "rejected deliveries must not reach Hermes");
+  } finally {
+    bridge.restore();
+    await mock.close();
+  }
+});
 
 test("happy path: created webhook → scripted SSE → exact Linear activity sequence + correlation trace", async () => {
   const mock = await startMockHermes(() => ({

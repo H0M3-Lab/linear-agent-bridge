@@ -74,7 +74,9 @@ The active runtime lives in `src/runtime/*`.
 High level flow:
 
 1. Linear sends a webhook to `/plugins/linear/linear`.
-2. The bridge validates the signature, normalizes the payload, and returns `202` quickly.
+2. The bridge validates the signature, writes the delivery to its persistent queue, then returns
+   `202` quickly. Pending deliveries are retried after process restarts; configure a persistent
+   volume for `LINEAR_EVENT_STORE_DIR` in standalone deployments.
 3. The bridge resolves the Linear session identity and maps it to:
    `agent:<agentId>:linear:session:<linearSessionId>`
 4. The bridge posts an immediate visible `thought` activity.
@@ -210,6 +212,10 @@ npm test
 ```
 
 Compiled output goes to `dist/`. Run the standalone server with `npm start`.
+
+The container workflow publishes multi-architecture images to
+`ghcr.io/h0m3-lab/linear-agent-bridge:sha-<commit>` on pushes to `main`. Use the immutable commit
+tag in deployment configuration.
 
 ## Local install (OpenClaw plugin)
 

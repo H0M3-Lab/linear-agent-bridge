@@ -17,5 +17,6 @@ test("verifySignature rejects a missing or invalid signature", () => {
   const raw = Buffer.from('{"hello":"world"}');
 
   assert.equal(verifySignature(secret, undefined, raw), false);
+  assert.equal(verifySignature(undefined, "00", raw), false);
   assert.equal(verifySignature(secret, "deadbeef", raw), false);
 });

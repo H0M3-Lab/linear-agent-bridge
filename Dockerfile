@@ -5,19 +5,21 @@
 # has no runtime dependencies — only Node built-ins and global fetch — so the
 # runtime stage ships just the compiled dist/.
 
-FROM node:22-alpine AS build
+# Use Debian-based Node images for predictable npm behavior across CI builders.
+FROM node:22-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.json ./
-RUN npm ci
+RUN node --version && npm --version && npm ci --no-audit --no-fund
 COPY index.ts server.ts ./
 COPY src ./src
-RUN npm run build
+RUN npm run build && find dist -name '*.test.js' -delete
 
-FROM node:22-alpine AS runtime
+FROM node:22-bookworm-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
-COPY package.json ./
-COPY --from=build /app/dist ./dist
+COPY --chown=node:node package.json LICENSE ./
+COPY --from=build --chown=node:node /app/dist ./dist
 # Railway injects PORT; the server defaults to 8080 when unset.
 EXPOSE 8080
+USER node
 CMD ["node", "dist/server.js"]
